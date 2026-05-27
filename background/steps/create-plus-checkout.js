@@ -33,8 +33,9 @@
   const HOSTED_CHECKOUT_VERIFICATION_RESULT_SETTLE_MS = 8000;
   const HOSTED_CHECKOUT_FIRST_DIRECT_RESEND_DELAY_MS = 1000;
   const PAYPAL_GENERIC_ERROR_SESSION_SETTLE_WAIT_MS = 5000;
-  const PAYPAL_GENERIC_ERROR_RECOVERY_MAX_ATTEMPTS = 1;
-  const PAYPAL_APPROVAL_BRANCH_RECOVERY_MAX_ATTEMPTS = 1;
+  const PAYPAL_GENERIC_ERROR_RECOVERY_MAX_ATTEMPTS = 2;
+  const PAYPAL_APPROVAL_BRANCH_RECOVERY_MAX_ATTEMPTS = 2;
+  const HOSTED_HERMES_STALL_OBSERVATION_LIMIT = 8;
   const CLOUD_CHECKOUT_ACCESS_TOKEN_MAX_ATTEMPTS = 2;
   const CLOUD_CHECKOUT_REQUEST_MAX_RETRIES = 3;
   const CLOUD_CHECKOUT_RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -430,6 +431,99 @@
 
     function getPayPalApprovalBranchRecoveryCount(state = {}) {
       return Math.max(0, Math.floor(Number(state?.paypalApprovalBranchRecoveryCount) || 0));
+    }
+
+    function shouldAutoRecoverPayPalGenericError(state = {}) {
+      return getPayPalGenericErrorRecoveryCount(state) < PAYPAL_GENERIC_ERROR_RECOVERY_MAX_ATTEMPTS;
+    }
+
+    function shouldAutoRecoverPayPalApprovalBranch(state = {}) {
+      return getPayPalApprovalBranchRecoveryCount(state) < PAYPAL_APPROVAL_BRANCH_RECOVERY_MAX_ATTEMPTS;
+    }
+
+    function buildHostedHermesObservationSignature(url = '', pageState = {}) {
+      return JSON.stringify({
+        url: normalizeString(url).slice(0, 240),
+        stage: normalizeString(pageState?.hostedStage).toLowerCase(),
+        readyState: normalizeString(pageState?.readyState).toLowerCase(),
+        redirecting: Boolean(pageState?.hostedRedirecting),
+        redirectingMessage: normalizeString(pageState?.hostedRedirectingMessage).slice(0, 240),
+        reviewConsentReady: Boolean(pageState?.reviewConsentReady),
+        approveReady: Boolean(pageState?.approveReady),
+        bodyTextPreview: normalizeString(pageState?.bodyTextPreview).slice(0, 240),
+      });
+    }
+
+    function assessHostedHermesRecoveryState(url = '', pageState = {}, previousState = {}) {
+      const stage = normalizeString(pageState?.hostedStage).toLowerCase() || 'unknown';
+      const readyState = normalizeString(pageState?.readyState).toLowerCase();
+      const isHermes = isPayPalHermesUrl(url);
+      const signature = isHermes ? buildHostedHermesObservationSignature(url, pageState) : '';
+      if (!isHermes) {
+        return {
+          isHermes,
+          stage,
+          signature,
+          nextCount: 0,
+          shouldRecover: false,
+          shouldWait: false,
+        };
+      }
+      if (
+        pageState?.hostedRedirecting
+        || stage === 'redirecting'
+        || /saving\s+your\s+info.*sending\s+you\s+back\s+to\s+the\s+merchant/i.test(String(pageState?.hostedRedirectingMessage || ''))
+      ) {
+        return {
+          isHermes,
+          stage,
+          signature,
+          nextCount: 0,
+          shouldRecover: false,
+          shouldWait: true,
+        };
+      }
+      if (['review_consent', 'guest_checkout', 'verification', 'pay_login', 'account_create_email'].includes(stage)) {
+        return {
+          isHermes,
+          stage,
+          signature,
+          nextCount: 0,
+          shouldRecover: false,
+          shouldWait: false,
+        };
+      }
+      if (stage === 'unknown' && readyState && readyState !== 'complete') {
+        return {
+          isHermes,
+          stage,
+          signature,
+          nextCount: 0,
+          shouldRecover: false,
+          shouldWait: true,
+        };
+      }
+      if (!['approval', 'unknown'].includes(stage)) {
+        return {
+          isHermes,
+          stage,
+          signature,
+          nextCount: 0,
+          shouldRecover: false,
+          shouldWait: false,
+        };
+      }
+      const previousSignature = normalizeString(previousState?.signature);
+      const previousCount = Math.max(0, Math.floor(Number(previousState?.count) || 0));
+      const nextCount = previousSignature === signature ? previousCount + 1 : 1;
+      return {
+        isHermes,
+        stage,
+        signature,
+        nextCount,
+        shouldRecover: nextCount >= HOSTED_HERMES_STALL_OBSERVATION_LIMIT,
+        shouldWait: false,
+      };
     }
 
     function isHostedCheckoutNonFreeTrialFailure(error) {
@@ -2590,7 +2684,7 @@ function FindProxyForURL(url, host) {
         : {};
       const recoveryCount = getPayPalApprovalBranchRecoveryCount(latestState);
       const normalizedLabel = String(branchLabel || 'PayPal Hermes / 普通授权页').trim() || 'PayPal Hermes / 普通授权页';
-      if (recoveryCount < PAYPAL_APPROVAL_BRANCH_RECOVERY_MAX_ATTEMPTS) {
+      if (shouldAutoRecoverPayPalApprovalBranch(latestState)) {
         return recoverFromPayPalApprovalBranch(tabId, normalizedLabel, completionPayload, latestState);
       }
 
@@ -2638,7 +2732,7 @@ function FindProxyForURL(url, host) {
           };
         }
         const planTypeSuffix = inspection?.planType ? `（planType=${inspection.planType}）` : '';
-        if (recoveryCount < PAYPAL_GENERIC_ERROR_RECOVERY_MAX_ATTEMPTS) {
+        if (shouldAutoRecoverPayPalGenericError(latestState)) {
           await addLog(
             `步骤 6：PayPal hosted checkout 返回 genericError，刷新 ChatGPT 会话后暂未检测到 PLUS 生效${planTypeSuffix}，准备自动清理 PayPal 会话并重建 Checkout。`,
             'warn'
@@ -2654,7 +2748,7 @@ function FindProxyForURL(url, host) {
         if (message.includes(HOSTED_CHECKOUT_GENERIC_ERROR_PREFIX)) {
           throw error;
         }
-        if (recoveryCount < PAYPAL_GENERIC_ERROR_RECOVERY_MAX_ATTEMPTS) {
+        if (shouldAutoRecoverPayPalGenericError(latestState)) {
           await addLog(
             `步骤 6：PayPal hosted checkout 返回 genericError，刷新 ChatGPT 会话检查 PLUS 状态失败，仍将尝试自动清理 PayPal 会话并重建 Checkout。原因：${message}`,
             'warn'
@@ -3062,7 +3156,9 @@ function FindProxyForURL(url, host) {
       let hostedVerificationLastSubmittedAt = 0;
       let hostedGuestCardErrorRetries = 0;
       let hostedGuestCardErrorRetrySettlingUntil = 0;
-      let hostedHermesEncounterCount = 0;
+      let hostedHermesStalledObservationCount = 0;
+      let hostedHermesStalledSignature = '';
+      let loggedHostedHermesRedirecting = false;
       const hostedVerificationAttemptedCodes = new Set();
       while (Date.now() - startedAt < HOSTED_CHECKOUT_PAYPAL_LOOP_TIMEOUT_MS) {
         throwIfStopped();
@@ -3085,30 +3181,7 @@ function FindProxyForURL(url, host) {
           return;
         }
 
-        if (isPayPalHermesUrl(currentUrl)) {
-          hostedHermesEncounterCount += 1;
-          if (hostedHermesEncounterCount > 1) {
-            return requestHostedCheckoutApprovalBranchRecovery(tabId, 'PayPal Hermes 复核页', completionPayload);
-          }
-          hostedVerificationSubmitted = false;
-          loggedWaitingForHostedVerificationResult = false;
-          await addLog(`步骤 6：检测到 PayPal Hermes 复核页（${currentUrl}），按油猴脚本方式直接等待并点击 Agree and Continue...`, 'info');
-          try {
-            await runHostedCheckoutPayPalStep(tabId, {
-              ...guestProfile,
-            });
-          } catch (error) {
-            await addLog(`步骤 6：PayPal Hermes 复核页处理失败，准备关闭旧页并重建 Checkout。原因：${error?.message || String(error || '未知错误')}`, 'warn');
-            return requestHostedCheckoutApprovalBranchRecovery(tabId, 'PayPal Hermes 复核页', completionPayload);
-          }
-          await sleepWithStop(1000);
-          continue;
-        }
-
         const pageState = await getHostedCheckoutPayPalState(tabId);
-        if (pageState.hostedStage !== 'review_consent') {
-          hostedHermesEncounterCount = 0;
-        }
         if (pageState.hostedStage === 'blocked' || pageState.hostedBlocked) {
           const blockedMessage = String(
             pageState.hostedBlockedMessage
@@ -3120,6 +3193,37 @@ function FindProxyForURL(url, host) {
         if (pageState.hostedStage === 'generic_error' || pageState.hostedGenericError) {
           return requestHostedCheckoutGenericErrorChoice(tabId, pageState, completionPayload);
         }
+        const hermesAssessment = assessHostedHermesRecoveryState(currentUrl, pageState, {
+          count: hostedHermesStalledObservationCount,
+          signature: hostedHermesStalledSignature,
+        });
+        if (hermesAssessment.isHermes) {
+          if (hermesAssessment.shouldWait || hermesAssessment.nextCount === 0) {
+            hostedHermesStalledObservationCount = 0;
+            hostedHermesStalledSignature = '';
+          } else {
+            hostedHermesStalledObservationCount = hermesAssessment.nextCount;
+            hostedHermesStalledSignature = hermesAssessment.signature;
+          }
+        } else {
+          hostedHermesStalledObservationCount = 0;
+          hostedHermesStalledSignature = '';
+        }
+
+        if (pageState.hostedStage === 'redirecting' || pageState.hostedRedirecting) {
+          hostedVerificationSubmitted = false;
+          loggedWaitingForHostedVerificationResult = false;
+          if (!loggedHostedHermesRedirecting) {
+            await addLog(
+              `步骤 6：PayPal Hermes 正在保存信息并回跳商户页，继续耐心等待 URL 变化。${pageState.hostedRedirectingMessage ? ` 文案：${pageState.hostedRedirectingMessage}` : ''}`,
+              'info'
+            );
+            loggedHostedHermesRedirecting = true;
+          }
+          await sleepWithStop(1000);
+          continue;
+        }
+        loggedHostedHermesRedirecting = false;
 
         if (pageState.hostedGuestPhoneError) {
           const phoneErrorMessage = String(
@@ -3345,7 +3449,27 @@ function FindProxyForURL(url, host) {
         }
 
         if (pageState.hostedStage === 'approval') {
-          return requestHostedCheckoutApprovalBranchRecovery(tabId, 'PayPal 普通授权页', completionPayload);
+          if (hermesAssessment.shouldRecover) {
+            await addLog(
+              `步骤 6：PayPal 普通授权页已连续 ${hermesAssessment.nextCount} 轮无进展，准备关闭旧页并重建 Checkout。`,
+              'warn'
+            );
+            return requestHostedCheckoutApprovalBranchRecovery(tabId, 'PayPal 普通授权页', completionPayload);
+          }
+          await sleepWithStop(1000);
+          continue;
+        }
+
+        if (
+          hermesAssessment.isHermes
+          && hermesAssessment.stage === 'unknown'
+          && hermesAssessment.shouldRecover
+        ) {
+          await addLog(
+            `步骤 6：PayPal Hermes 复核页已连续 ${hermesAssessment.nextCount} 轮无进展（stage=unknown），准备关闭旧页并重建 Checkout。`,
+            'warn'
+          );
+          return requestHostedCheckoutApprovalBranchRecovery(tabId, 'PayPal Hermes 复核页', completionPayload);
         }
 
         await sleepWithStop(1000);
@@ -4170,6 +4294,11 @@ function FindProxyForURL(url, host) {
       fetchHostedCheckoutVerificationCodeManually,
       testCheckoutConversionProxy,
       __test: {
+        HOSTED_HERMES_STALL_OBSERVATION_LIMIT,
+        PAYPAL_APPROVAL_BRANCH_RECOVERY_MAX_ATTEMPTS,
+        PAYPAL_GENERIC_ERROR_RECOVERY_MAX_ATTEMPTS,
+        assessHostedHermesRecoveryState,
+        buildHostedHermesObservationSignature,
         generateCloudCheckoutFromApiWithRetry,
         getPayPalApprovalBranchRecoveryCount,
         getPayPalGenericErrorRecoveryCount,
@@ -4178,6 +4307,8 @@ function FindProxyForURL(url, host) {
         isCloudCheckoutRetryableError,
         readCloudCheckoutAccessTokenWithRetry,
         refreshOAuthTimeoutWindowAfterHostedCheckoutSuccess,
+        shouldAutoRecoverPayPalApprovalBranch,
+        shouldAutoRecoverPayPalGenericError,
         shouldClearPayPalSessionCookie,
         shouldClearPayPalSessionCookiesBeforeCheckoutCreate,
         waitForHostedCheckoutVerificationCodeWindow,

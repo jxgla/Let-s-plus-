@@ -23,6 +23,21 @@ test('paypal approval branch recovery count normalizes invalid values to zero', 
   assert.equal(executor.__test.getPayPalApprovalBranchRecoveryCount({ paypalApprovalBranchRecoveryCount: '1.8' }), 1);
 });
 
+test('paypal hosted recovery thresholds allow two automatic retries before manual confirmation', () => {
+  const executor = createExecutor();
+
+  assert.equal(executor.__test.PAYPAL_GENERIC_ERROR_RECOVERY_MAX_ATTEMPTS, 2);
+  assert.equal(executor.__test.PAYPAL_APPROVAL_BRANCH_RECOVERY_MAX_ATTEMPTS, 2);
+
+  assert.equal(executor.__test.shouldAutoRecoverPayPalGenericError({ paypalGenericErrorRecoveryCount: 0 }), true);
+  assert.equal(executor.__test.shouldAutoRecoverPayPalGenericError({ paypalGenericErrorRecoveryCount: 1 }), true);
+  assert.equal(executor.__test.shouldAutoRecoverPayPalGenericError({ paypalGenericErrorRecoveryCount: 2 }), false);
+
+  assert.equal(executor.__test.shouldAutoRecoverPayPalApprovalBranch({ paypalApprovalBranchRecoveryCount: 0 }), true);
+  assert.equal(executor.__test.shouldAutoRecoverPayPalApprovalBranch({ paypalApprovalBranchRecoveryCount: 1 }), true);
+  assert.equal(executor.__test.shouldAutoRecoverPayPalApprovalBranch({ paypalApprovalBranchRecoveryCount: 2 }), false);
+});
+
 test('paypal session cookie matcher covers required domains and subdomains only', () => {
   const executor = createExecutor();
   const shouldClear = executor.__test.shouldClearPayPalSessionCookie;
